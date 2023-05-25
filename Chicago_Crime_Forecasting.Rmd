@@ -1,0 +1,369 @@
+---
+title: "Time Series Final Project - Forecasting Hourly Crime at the Neighborhood Level in Chicago"
+author: "Ian Vogt"
+date: "2023-05-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Set the working directory and load in any required packages
+setwd('~/UChicago/MSCA 31006 - Time Series Analysis & Forecasting')
+library(tidyverse)
+library(dplyr)
+library(lubridate)
+library(tseries)
+library(forecast)
+library(prophet)
+library(Metrics)
+```
+
+I. DATA PROCESSING
+
+```{r}
+# Load in the data
+crimes <- read_csv('crimes.csv')
+```
+
+```{r}
+# Convert the 'Date' column from string to datetime format
+crimes$Datetime <- as.POSIXct(crimes$Date, format = '%m/%d/%Y %I:%M:%S %p')
+
+# Order the df by Datetime
+crimes <- crimes[order(crimes$Datetime),]
+```
+
+```{r}
+# Create separate columns for date and time
+crimes$date_new <- as.Date(crimes$Datetime)
+crimes$time <- format(crimes$Datetime, format = "%H:%M:%S")
+```
+
+```{r}
+# Only crimes in Chicago's Near North Neighborhood
+crimes_nn <- crimes[crimes$`Community Area` == 8, ]
+```
+
+```{r}
+# Create a dummy variable for each instance of a crime committed in the data (all rows)
+crimes_nn$dummy <- 1
+
+# Do a daily aggregation of crimes in Near North
+crimes_daily <- crimes_nn %>% group_by(date_new) %>% summarize(count=sum(dummy))
+
+# Do an hourly aggregation of crimes in Near North
+crimes_hourly_inc <- crimes_nn %>%
+  mutate(hour = floor_date(Datetime, "hour")) %>%
+  group_by(hour) %>%
+  summarize(count = sum(dummy))
+```
+
+```{r}
+# Because a crime is not recorded every hour in Near North Neighborhood,
+# a simple aggregation leaves missing values left over. We want to replace these with
+# zeroes. Let's create a new, empty time-series with all the times we want, left_join
+# with the data we created, and replace NAs with zeroes.
+# Load the lubridate package for working with dates and times
+
+# Set the start and end timestamps
+start_timestamp <- ymd_hms("2018-01-01 00:00:00")
+end_timestamp <- ymd_hms("2023-04-30 23:00:00")
+
+# Generate a sequence of hourly timestamps
+hourly_timestamps <- seq(start_timestamp, end_timestamp, by = "hour")
+
+# Create a dataframe with the timestamps
+crimes_hourly <- data.frame(timestamp = hourly_timestamps)
+
+# Adjust column names
+colnames(crimes_hourly) <- c('hour')
+colnames(crimes_hourly_inc) <- c('hour', 'count_inc')
+
+# Left join
+crimes_hourly <- left_join(crimes_hourly, crimes_hourly_inc, by='hour')
+
+# For some reason the crime counts were shifted 6 hours forward, so let's adjust with lead
+crimes_hourly <- crimes_hourly %>%
+  mutate(count = lead(count_inc, n = 6))
+
+# Drop the count_inc column
+crimes_hourly <- crimes_hourly[, -2]
+
+# Now replace NAs with zeroes
+crimes_hourly$count[is.na(crimes_hourly$count)] <- 0
+
+# View the new crimes_hourly df and verify that there were 0 crimes recorded
+# for 2018-01-01 06:00:00
+head(crimes_hourly, 10)
+
+# Compare to original aggregation crimes_hourly_inc. We can see the first few values
+# are the same with our lead adjustment from above
+head(crimes_hourly_inc, 10)
+```
+
+```{r}
+# Trim the hourly data to 2021 - 2023 so that it's only ~20,000 observations
+# Match the daily data accordingly
+#crimes_hourly_trim <- crimes_hourly[26305:46704,]
+#crimes_daily_trim <- crimes_daily[1097:1947,]
+
+# Create TS objects
+ts_crimes_daily <- ts(crimes_daily$count, frequency=365.2) # because we have 1 leap year
+                                                                  # out of 5.33 years of data
+ts_crimes_hourly <- ts(crimes_hourly$count, frequency=24)
+ts_crimes_weekly <- ts(crimes_hourly$count, frequency=168) # day of the week seasonality
+```
+
+II. EDA AND ASSUMPTION CHECKING
+
+```{r}
+# Plotting the daily and hourly crime
+# Note that the weekly and daily plots will look the same since they are taken from the
+# same data with only frequency calculated differently, so we won't bother plotting weekly
+ts.plot(ts_crimes_daily, ylab='Daily Crime Count',
+        main='Daily Crime Data - January 2018 to April 2023')
+ts.plot(ts_crimes_hourly, ylab='Hourly Crime Count',
+        main='Hourly Crime Data - January 2018 to April 2023')
+
+# Plot 1 month of the daily TS
+ts.plot(ts_crimes_daily[1:30], ylab='Daily Crime Count',
+        main= 'January 2018')
+
+# Plot 1 week of the daily TS
+ts.plot(ts_crimes_hourly[1:168], ylab='Hourly Crime Count',
+        main='2018-01-01 to 2018-01-08 (1 Week)')
+```
+
+
+From the TS plots of smaller windows we can see crime tends to spike on the weekends every 6-7 days or so. From the hourly data, there appear to be multiple spikes in a day, perhaps one in the middle of the day and one overnight.
+
+```{r}
+# Inspect what appear to be some outliers
+crimes_daily_outliers <- filter(crimes_daily, count>100)
+print(crimes_daily_outliers)
+
+crimes_hourly_outliers <- filter(crimes_hourly, count>20)
+print(crimes_hourly_outliers)
+```
+
+There are a couple of days in the 2020 data that are anomalies. These are days where there was widespread protest and activism taking place across Chicago. Given the circumstances of the Covid-19 pandemic this type of activity is unlikely to occur at random. 
+
+```{r}
+# Check for stationarity of daily and hourly TS'
+adf_daily <- adf.test(ts_crimes_daily)
+print(adf_daily)
+
+adf_hourly <- adf.test(ts_crimes_hourly)
+print(adf_hourly)
+```
+
+```{r}
+# Check descriptive statistics
+summary(ts_crimes_daily)
+summary(ts_crimes_hourly) # at least 25% of hours do not have a crime logged within them
+```
+
+```{r}
+# STL decompositions for all 3 TS'
+ts_crimes_daily %>%
+  stl(t.window=15, s.window=15, robust=TRUE) %>%autoplot()
+
+ts_crimes_hourly %>%
+  stl(t.window=15, s.window=15, robust=TRUE) %>% autoplot()
+```
+
+The trend and seasonality are both easier to pick out when looking at the daily data but less apparent in the hourly data, perhaps because we are dealing a with much smaller numbers of crimes in the hourly time-frame vs. the daily time-frame.
+
+```{r}
+# Check for autocorrelation
+acf(ts_crimes_daily)
+acf(ts_crimes_hourly, main='ACF Plot of Hourly Crime')
+acf(ts_crimes_weekly)
+```
+
+There are some spikes in the hourly ACF plot which indicates some seasonality at the hourly level, although this was difficult to see with the STL decomposition. Based on the EDA, daily and hourly crime in Chicago's Near North Neighborhood both appear to have some seasonality (day of the week and hour of the day).
+
+```{r}
+# Create train/test splits
+cd_train <- crimes_daily[1:1461,] # split on January 1st, 2022
+cd_train_ts <- ts(cd_train$count, frequency = 365) # frequency repeats each year
+cd_test <- crimes_daily[1462:1946,]
+cd_test_ts <- ts(cd_test$count, frequency = 365) # frequency repeats each year
+
+ch_train <- crimes_hourly[1:35064,] # split on January 1st, 2022
+ch_train_ts_daily <- ts(ch_train$count, frequency = 24) # frequency repeats each day
+ch_test <- crimes_hourly[35065:46704,]
+ch_test_ts_daily <- ts(ch_test$count, frequency = 24) # frequency repeats each day
+
+ch_train_ts_weekly <- ts(ch_train$count, frequency = 168) # frequency repeats each week
+ch_test_ts_weekly <- ts(ch_test$count, frequency = 168)
+
+ch_train_ts_yearly <- ts(ch_train$count, frequency = 8760) # frequency repeats each year
+ch_test_ts_yearly <- ts(ch_test$count, frequency = 8760)
+
+ch_train_ts <- ts(ch_train$count) # no frequency assigned for 1st model
+ch_test_ts <- ts(ch_test$count)
+```
+
+III. MODEL FITTING AND FORECASTING
+
+```{r}
+# Fit some auto arima models on the hourly data
+aa1 <- auto.arima(ch_train_ts, seasonal = TRUE)
+print(aa1)
+acf(aa1$residuals, main='Non-Seasonal ARIMA Residuals')
+```
+
+```{r}
+# Forecast with the first non-seasonal model
+forecast_a <- forecast(aa1, h=11640)
+plot(forecast_a, xlab='Hour', ylab='Hourly Crime')
+#print(forecast_a, 10)
+```
+
+
+```{r}
+# Day of the week Seasonal Arima (frequency = 168)
+aa2 <- auto.arima(ch_train_ts_weekly)
+print(aa2)
+acf(aa2$residuals, main='Day-of-the-Week Seasonal ARIMA Residuals')
+```
+
+```{r}
+# Forecast with 1st seasonal model
+seasonal_forecast_a <- forecast(aa2, h=11640)
+plot(seasonal_forecast_a, xlab='Week', ylab='Hourly Crime')
+#print(seasonal_forecast_a)
+```
+
+
+```{r}
+# Hour of the day seasonality (frequency = 24)
+aa3 <- auto.arima(ch_train_ts_daily)
+print(aa3)
+acf(aa3$residuals, main='Hour-of-the-Day Seasonal ARIMA Residuals')
+```
+
+```{r}
+# Forecast with 2nd seasonal model
+seasonal_forecast_b <- forecast(aa3, h=11640)
+plot(seasonal_forecast_b, xlab='Day', ylab='Hourly Crime')
+#print(seasonal_forecast_b)
+```
+
+```{r}
+# Day of the year Seasonal Arima (frequency = 8765)
+#aa4 <- auto.arima(ch_train_ts_yearly)
+#print(aa4)
+#acf(aa4$residuals)
+```
+
+```{r}
+# Forecast with 3rd seasonal model
+#seasonal_forecast_c <- forecast(aa4, h=11640)
+#plot(seasonal_forecast_c, xlab='Year', ylab='Hourly Crime')
+#print(seasonal_forecast_c)
+```
+
+```{r}
+# Process a train and test df for Prophet formatting (daily level)
+cd_train2 <- cd_train
+colnames(cd_train2) <- c('ds', 'y')
+
+# Fit a Prophet model
+d <- prophet(cd_train2, yearly.seasonality=TRUE, daily.seasonality=TRUE)
+
+# Make a new df to store Prophet forecasts along with historical values
+prophet_d_test <- make_future_dataframe(d, periods = 365)
+
+# Forecast with Prophet model
+prophet_d_forecast <- predict(d, prophet_d_test)
+
+# Plot the Prophet forecast
+plot(d, prophet_d_forecast)
+```
+
+```{r}
+# Plotting forecast components
+prophet_plot_components(d, prophet_d_forecast)
+```
+
+```{r}
+# Process a train and test df for Prophet formatting (hourly level)
+ch_train2 <- ch_train
+colnames(ch_train2) <- c('ds', 'y')
+
+# Fit a Prophet model
+h <- prophet(ch_train2, yearly.seasonality=TRUE)
+
+# Make a new df to store Prophet forecasts along with historical values
+prophet_h_test <- make_future_dataframe(h, periods = 365)
+
+# Forecast with Prophet model
+prophet_h_forecast <- predict(h, prophet_h_test, freq = 'hour')
+
+# Plot the Prophet forecast
+plot(h, prophet_h_forecast)
+```
+
+```{r}
+# Plotting forecast components
+prophet_plot_components(h, prophet_h_forecast)
+```
+
+IV. RESULTS ANAYLSIS
+
+```{r}
+# Take the point forecast for the hourly Prophet predictions
+prophet_h_forecast_points <- prophet_h_forecast$yhat[1:11640]
+```
+
+```{r}
+# Calculate accuracy metrics for the forecasts
+rmse1 <- sqrt(mean((forecast_a$mean - ch_test$count)^2))
+smape1 <-mean(2 * abs(
+  ch_test$count - forecast_a$mean) / (abs(ch_test$count) + abs(forecast_a$mean))) * 100
+mae1 <- mae(ch_test$count, forecast_a$mean)
+
+rmse2 <- sqrt(mean((seasonal_forecast_a$mean - ch_test$count)^2))
+smape2 <-mean(2 * abs(
+  ch_test$count - seasonal_forecast_a$mean) /
+    (abs(ch_test$count) + abs(seasonal_forecast_a$mean))) * 100
+mae2 <- mae(ch_test$count, seasonal_forecast_a$mean)
+
+
+rmse3 <- sqrt(mean((seasonal_forecast_b$mean - ch_test$count)^2))
+smape3 <-mean(2 * abs(
+  ch_test$count - seasonal_forecast_b$mean) /
+    (abs(ch_test$count) + abs(seasonal_forecast_b$mean))) * 100
+mae3 <- mae(ch_test$count, seasonal_forecast_b$mean)
+
+rmse4 <- sqrt(mean((prophet_h_forecast_points - ch_test$count)^2))
+smape4 <-mean(2 * abs(
+  ch_test$count - prophet_h_forecast_points) /
+    (abs(ch_test$count) + abs(prophet_h_forecast_points))) * 100
+mae4 <- mae(ch_test$count, prophet_h_forecast_points)
+
+# Store the calculated metrics in vectors
+rmse_results <- c(rmse1, rmse2, rmse3, rmse4)
+mae_results <- c(mae1, mae2, mae3, mae4)
+smape_results <- c(smape1, smape2, smape3, smape4)
+
+# Create an empty dataframe
+results <- data.frame(matrix(ncol = 4, nrow = 4))
+
+# Assign column names
+colnames(results) <- c('Model', 'MAE', 'RMSE', 'sMAPE')
+
+# Fill in data column-by-column
+results$Model <- c('Non-Seasonal Arima', 'Day-of-the-Week Seasonal Arima',
+                   'Hour-of-the-Day Seasonal Arima',
+                   'Prophet')
+results$MAE <- mae_results
+results$RMSE <- rmse_results
+results$sMAPE <- smape_results
+
+# View
+results
+```
+
